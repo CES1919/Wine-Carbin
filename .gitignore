@@ -1,0 +1,38 @@
+# Build output from every project directory
+**/[Bb]in/
+**/[Oo]bj/
+artifacts/
+publish/
+TestResults/
+coverage/
+*.trx
+*.coverage
+*.coveragexml
+
+# Compiled packages and binaries
+*.exe
+*.dll
+*.pdb
+*.nupkg
+*.snupkg
+*.deps.json
+*.runtimeconfig.json
+
+# Local tool state
+.dotnet-home/
+.localappdata/
+.nuget/
+
+# IDE and user settings
+.vs/
+.vscode/
+*.user
+*.suo
+*.log
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Diagnostic output
+WineCabinetSelfTestFailure.txt

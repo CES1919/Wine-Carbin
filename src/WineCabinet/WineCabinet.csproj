@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Wine Cabinet</AssemblyName>
+    <RootNamespace>WineCabinet</RootNamespace>
+    <ApplicationManifest>Properties\app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Product>Wine Cabinet</Product>
+    <Authors>Wine Cabinet contributors</Authors>
+    <Description>A lightweight desktop organizer for Windows.</Description>
+    <Copyright>Copyright (c) Wine Cabinet contributors</Copyright>
+    <Version>0.1.0</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <InformationalVersion>0.1.0</InformationalVersion>
+    <WineCabinetArtwork Condition="'$(WineCabinetArtwork)' == ''">$(MSBuildProjectDirectory)\..\..\assets\source\launcher.gif</WineCabinetArtwork>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="$(WineCabinetArtwork)" LogicalName="WineCabinet.Assets.launcher" />
+  </ItemGroup>
+  <Target Name="ValidateLauncherArtwork" BeforeTargets="PrepareResources">
+    <Error Condition="!Exists('$(WineCabinetArtwork)')"
+           Text="Launcher artwork was not found: $(WineCabinetArtwork)" />
+  </Target>
+</Project>
