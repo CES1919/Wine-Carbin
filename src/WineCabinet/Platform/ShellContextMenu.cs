@@ -91,13 +91,15 @@ internal sealed class ShellContextMenu : IDisposable
 
     internal static string ValidateRenameTarget(string name, bool isFileSystem)
     {
+        if (string.IsNullOrWhiteSpace(name)) throw new InvalidOperationException("名称不能为空。");
+        if (isFileSystem && name.EndsWith(' '))
+            throw new InvalidOperationException("名称不能以空格或句点结尾。");
         var trimmed = name.Trim();
-        if (trimmed.Length == 0) throw new InvalidOperationException("名称不能为空。");
         if (trimmed.Contains('\\') || trimmed.Contains('/') || trimmed.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
             throw new InvalidOperationException("名称包含无效字符。");
         if (isFileSystem)
         {
-            if (trimmed.EndsWith(' ') || trimmed.EndsWith('.'))
+            if (trimmed.EndsWith('.'))
                 throw new InvalidOperationException("名称不能以空格或句点结尾。");
             var dotIndex = trimmed.IndexOf('.');
             var deviceStem = (dotIndex >= 0 ? trimmed[..dotIndex] : trimmed).TrimEnd(' ');

@@ -40,6 +40,7 @@ internal sealed class FlyoutForm : Form
     private bool _edgePageArmed;
     private int _page;
     private int _gridDimension;
+    private bool _resourcesDisposed;
     internal bool AllowClose;
 
     public Size CurrentExpandedSize => _gridDimension == 4 ? SixteenGridSize : NineGridSize;
@@ -120,8 +121,16 @@ internal sealed class FlyoutForm : Form
         Deactivate += (_, _) => ScheduleHide();
         SizeChanged += (_, _) => { UpdateRegion(); LayoutPageIndicator(); };
         FormClosing += (_, e) => { if (!AllowClose) { e.Cancel = true; StartCollapse(); } };
-        FormClosed += (_, _) =>
+        _library.Changed += _libraryChangedHandler;
+        Rebuild();
+        UpdateRegion();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && !_resourcesDisposed)
         {
+            _resourcesDisposed = true;
             _library.Changed -= _libraryChangedHandler;
             _hideTimer.Stop();
             _animationTimer.Stop();
@@ -140,10 +149,8 @@ internal sealed class FlyoutForm : Form
                 if (_centerAnimationHandler is not null) ImageAnimator.StopAnimate(_centerImage, _centerAnimationHandler);
                 _centerArtwork?.Dispose();
             }
-        };
-        _library.Changed += _libraryChangedHandler;
-        Rebuild();
-        UpdateRegion();
+        }
+        base.Dispose(disposing);
     }
 
     public void ShowExpanded(Point center)

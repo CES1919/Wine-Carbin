@@ -94,6 +94,7 @@ internal sealed class LauncherForm : Form
             _trayIcon?.Dispose();
             _trayIconImage?.Dispose();
             _flyout.Close();
+            if (!_flyout.IsDisposed) _flyout.Dispose();
             _appMenu.Dispose();
             var region = Region;
             Region = null;
