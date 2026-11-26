@@ -42,9 +42,7 @@ internal sealed class LauncherPlacement
         Location = location;
         try
         {
-            var directory = System.IO.Path.GetDirectoryName(_path);
-            if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
-            File.WriteAllText(_path, JsonSerializer.Serialize(new PositionModel { X = location.X, Y = location.Y }));
+            AppStorage.WriteAllTextAtomic(_path, JsonSerializer.Serialize(new PositionModel { X = location.X, Y = location.Y }));
             return true;
         }
         catch

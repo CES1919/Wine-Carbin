@@ -15,6 +15,9 @@ internal sealed class LauncherForm : Form
     private readonly LauncherPlacement _placement;
     private readonly NotifyIcon? _trayIcon;
     private readonly Icon? _trayIconImage;
+    private LibraryFileWatcher? _fileWatcher;
+    private bool _hasExplicitPlacement;
+    private Point _initialLocation;
     private bool _dragging;
     private bool _dragMoved;
     private Point _pointerDownAt;
@@ -28,6 +31,7 @@ internal sealed class LauncherForm : Form
     {
         _library = library;
         _placement = placement;
+        _hasExplicitPlacement = placement.Location.HasValue;
         _appMenu = AppMenu.Create();
         _flyout = new FlyoutForm(library, this);
         Text = "Wine Cabinet";
@@ -64,16 +68,12 @@ internal sealed class LauncherForm : Form
                        LauncherPlacementRules.TryRestore(saved, Size, workingAreas, out var restored)
                 ? restored
                 : LauncherPlacementRules.DefaultLocation(Size, rightExtent, Screen.PrimaryScreen!.WorkingArea);
+            _initialLocation = Location;
             UpdateRegion();
         };
+        Shown += (_, _) => _fileWatcher ??= new LibraryFileWatcher(_library, this);
         SizeChanged += (_, _) => UpdateRegion();
         Paint += PaintLauncher;
-        MouseEnter += (_, _) =>
-        {
-            // Entering while the left button is held continues an external drag.
-            if ((Control.MouseButtons & MouseButtons.Left) != 0)
-                BeginExternalMove(Cursor.Position);
-        };
         MouseLeave += (_, _) =>
         {
             if (!_dragging && _flyout.Visible) ScheduleFlyoutHide();
@@ -81,14 +81,23 @@ internal sealed class LauncherForm : Form
         MouseDown += OnMouseDown;
         MouseMove += OnMouseMove;
         MouseUp += OnMouseUp;
+        MouseCaptureChanged += (_, _) =>
+        {
+            if (!Capture && _dragging) EndExternalMove();
+        };
         DragEnter += OnDragEnter;
         DragDrop += OnDragDrop;
         FormClosed += (_, _) =>
         {
             PersistPlacement();
+            _fileWatcher?.Dispose();
             _trayIcon?.Dispose();
             _trayIconImage?.Dispose();
             _flyout.Close();
+            _appMenu.Dispose();
+            var region = Region;
+            Region = null;
+            region?.Dispose();
             if (_launcherImage is not null)
             {
                 if (_animationHandler is not null) ImageAnimator.StopAnimate(_launcherImage, _animationHandler);
@@ -170,9 +179,8 @@ internal sealed class LauncherForm : Form
         _dragging = true;
         _dragMoved = false;
         _pointerDownAt = screenPoint;
-        _dragOffset = new Point(Width / 2, Height / 2);
+        _dragOffset = new Point(screenPoint.X - Left, screenPoint.Y - Top);
         Capture = true;
-        MoveExternal(screenPoint);
     }
 
     public void MoveExternal(Point screenPoint)
@@ -180,22 +188,27 @@ internal sealed class LauncherForm : Form
         if (!_dragging) return;
         var area = Screen.FromPoint(screenPoint).WorkingArea;
         var next = new Point(
-            Math.Clamp(screenPoint.X - _dragOffset.X, area.Left, area.Right - Width),
-            Math.Clamp(screenPoint.Y - _dragOffset.Y, area.Top, area.Bottom - Height));
+            Math.Clamp(screenPoint.X - _dragOffset.X, area.Left, Math.Max(area.Left, area.Right - Width)),
+            Math.Clamp(screenPoint.Y - _dragOffset.Y, area.Top, Math.Max(area.Top, area.Bottom - Height)));
         Location = next;
         _flyout.Reposition(new Point(Left + Width / 2, Top + Height / 2));
     }
 
     public void EndExternalMove()
     {
+        var moved = _dragMoved || Location != _initialLocation;
         _dragging = false;
-        Capture = false;
+        _dragMoved = false;
+        if (Capture) Capture = false;
+        if (moved) _hasExplicitPlacement = true;
         PersistPlacement();
     }
 
     private void PersistPlacement()
     {
+        if (!_hasExplicitPlacement && Location == _initialLocation) return;
         if (_placement.Location == Location) return;
+        _hasExplicitPlacement = true;
         _placement.TrySave(Location);
     }
 
@@ -211,9 +224,10 @@ internal sealed class LauncherForm : Form
 
     private void OnMouseUp(object? sender, MouseEventArgs e)
     {
+        if (e.Button != MouseButtons.Left || !_dragging) return;
         var wasClick = !_dragMoved;
         EndExternalMove();
-        if (e.Button == MouseButtons.Left && wasClick) ToggleFlyout();
+        if (wasClick) ToggleFlyout();
     }
 
     private void OnMouseMove(object? sender, MouseEventArgs e)
@@ -252,13 +266,8 @@ internal sealed class LauncherForm : Form
             }
             else if (e.Data is not null)
             {
-                foreach (var item in ShellDropHelper.ReadShellItems(e.Data))
-                {
-                    if (File.Exists(item.ParsingName) || Directory.Exists(item.ParsingName))
-                        _library.AddFiles(new[] { item.ParsingName });
-                    else
-                        _library.AddShellItem(item.Name, item.ParsingName);
-                }
+                var result = _library.AddDroppedShellItems(ShellDropHelper.ReadShellItems(e.Data));
+                warning = result.warning;
             }
             ShowFlyout();
             if (warning is not null)
@@ -288,26 +297,28 @@ internal sealed class LauncherForm : Form
 
     private void UpdateRegion()
     {
+        if (Width < 2 || Height < 2) return;
         using var path = RoundedRectangle(ClientRectangle, 13);
+        var previous = Region;
         Region = new Region(path);
+        previous?.Dispose();
     }
 
     private static GraphicsPath RoundedRectangle(Rectangle rect, int radius)
     {
         var path = new GraphicsPath();
-        var d = radius * 2;
+        var d = Math.Min(radius * 2, Math.Min(rect.Width, rect.Height));
+        if (d < 1)
+        {
+            path.AddRectangle(rect);
+            return path;
+        }
         path.AddArc(rect.Left, rect.Top, d, d, 180, 90);
         path.AddArc(rect.Right - d, rect.Top, d, d, 270, 90);
         path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
         path.AddArc(rect.Left, rect.Bottom - d, d, d, 90, 90);
         path.CloseFigure();
         return path;
-    }
-
-    internal void AddSystemIcon(string name, string parsingName)
-    {
-        _library.AddShellItem(name, parsingName);
-        ShowFlyout();
     }
 
     internal void ExitApplication()

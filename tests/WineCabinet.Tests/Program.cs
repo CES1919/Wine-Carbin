@@ -302,6 +302,116 @@ internal static class Program
                 Require(LauncherPlacement.LoadFrom(uiPlacementPath).Location == closedLauncher,
                     "closing the launcher must persist its final position");
             }
+
+            var untouchedPlacementPath = Path.Combine(testRoot, "UntouchedPlacement", LauncherPlacement.FileName);
+            using (var defaultLauncher = new LauncherForm(
+                       ShortcutLibrary.CreateForTesting(Path.Combine(testRoot, "UntouchedLibrary"), new List<ShortcutItem>()),
+                       LauncherPlacement.LoadFrom(untouchedPlacementPath)))
+            {
+                defaultLauncher.Show();
+                Application.DoEvents();
+                defaultLauncher.Close();
+                Application.DoEvents();
+                Require(!File.Exists(untouchedPlacementPath),
+                    "closing a never-moved launcher must not persist the computed default position");
+            }
+
+            // Security regression: CIDA / PIDL validation must reject out-of-bounds and unterminated payloads.
+            byte[] BuildCida(int parentOffset, int childOffset, byte[] payload)
+            {
+                var buffer = new byte[12 + payload.Length];
+                BitConverter.TryWriteBytes(buffer.AsSpan(0, 4), 1);
+                BitConverter.TryWriteBytes(buffer.AsSpan(4, 4), parentOffset);
+                BitConverter.TryWriteBytes(buffer.AsSpan(8, 4), childOffset);
+                payload.CopyTo(buffer, 12);
+                return buffer;
+            }
+            Require(!ShellDropHelper.TryReadValidatedCidaOffsets(BuildCida(-4, 12, new byte[] { 0, 0 }), out _, out _),
+                "negative parentOffset in CIDA payload must be rejected");
+            Require(!ShellDropHelper.TryReadValidatedCidaOffsets(BuildCida(999, 12, new byte[] { 0, 0 }), out _, out _),
+                "out-of-bounds parentOffset in CIDA payload must be rejected");
+            Require(!ShellDropHelper.TryReadValidatedCidaOffsets(BuildCida(4, 12, new byte[] { 0, 0 }), out _, out _),
+                "parentOffset overlapping the CIDA header must be rejected");
+            Require(!ShellDropHelper.TryReadValidatedCidaOffsets(BuildCida(12, 14, new byte[] { 4, 0, 1, 2 }), out _, out _),
+                "unterminated PIDL without trailing zero length must be rejected");
+            Require(!ShellDropHelper.IsValidPidl(new byte[] { 1, 0, 0, 0 }, 0),
+                "SHITEMID with cb < 2 must be rejected");
+            var validCida = BuildCida(12, 14, new byte[] { 0, 0, 4, 0, 0x41, 0x42, 0, 0 });
+            Require(ShellDropHelper.TryReadValidatedCidaOffsets(validCida, out var validParent, out var validChildren) &&
+                    validParent == 12 && validChildren.SequenceEqual(new[] { 14 }),
+                "well-formed CIDA payload must be accepted");
+
+            // Security regression: ExtractClsid must only accept top-level desktop ::{GUID} parsing names.
+            Require(ShellDesktopIconManager.ExtractClsid(ShellDropHelper.ThisPc) == "{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+                "top-level desktop CLSID parsing name must be extracted");
+            Require(ShellDesktopIconManager.ExtractClsid("::{645ff040-5081-101b-9f08-00aa002f954e}") == "{645FF040-5081-101B-9F08-00AA002F954E}",
+                "lowercase CLSID must normalize to canonical uppercase GUID");
+            Require(ShellDesktopIconManager.ExtractClsid(ShellDropHelper.ThisPc + @"\SubItem") is null,
+                "nested shell namespace items must not extract parent desktop CLSID");
+            Require(ShellDesktopIconManager.ExtractClsid("foo{not-a-guid}") is null,
+                "arbitrary strings containing braces must not extract a CLSID");
+
+            // Rename validation & case-only directory rename regression.
+            Require(ShellContextMenu.ValidateRenameTarget("console.txt", true) == "console.txt",
+                "valid file names must pass rename validation");
+            foreach (var badName in new[] { "", "   ", "a/b", @"a\b", "bad.", "bad ", "CON", "nul.txt", "COM1", "LPT9.log" })
+            {
+                var rejected = false;
+                try { ShellContextMenu.ValidateRenameTarget(badName, true); }
+                catch (InvalidOperationException) { rejected = true; }
+                Require(rejected, $"invalid or reserved file name '{badName}' must be rejected");
+            }
+            var caseDir = Path.Combine(managedDirectory, "casefolder");
+            Directory.CreateDirectory(caseDir);
+            using (var dirMenu = ShellContextMenu.Create(caseDir, menuOwner.Handle))
+            {
+                var renamedDir = dirMenu.Rename(menuOwner.Handle, "CaseFolder");
+                var actualName = Path.GetFileName(Directory.GetDirectories(managedDirectory, "CaseFolder").Single());
+                Require(Path.GetFileName(renamedDir) == "CaseFolder" && actualName == "CaseFolder",
+                    "case-only directory rename must succeed on Windows");
+            }
+
+            // Persistence resilience, UniquePath for dotted directories, and stale restore regression.
+            var corruptRoot = Path.Combine(testRoot, "CorruptLibrary");
+            Directory.CreateDirectory(corruptRoot);
+            File.WriteAllText(Path.Combine(corruptRoot, "library.json"), "{ invalid json");
+            var recoveredLibrary = ShortcutLibrary.LoadFrom(corruptRoot);
+            Require(recoveredLibrary.Items.Count == 0 && File.Exists(Path.Combine(corruptRoot, "library.json.corrupt")),
+                "loading a damaged library.json must preserve a .corrupt backup and continue safely");
+
+            var nullEntryRoot = Path.Combine(testRoot, "NullEntryLibrary");
+            Directory.CreateDirectory(nullEntryRoot);
+            File.WriteAllText(Path.Combine(nullEntryRoot, "library.json"),
+                "[null, { \"Name\": \"VirtualItem\", \"Path\": \"virtual:null-test\", \"IsShellItem\": true }]");
+            var nullFilteredLibrary = ShortcutLibrary.LoadFrom(nullEntryRoot);
+            Require(nullFilteredLibrary.Items.Count == 1,
+                "null entries in library.json must be skipped without discarding valid entries");
+
+            var dottedDirParent = Path.Combine(testRoot, "DottedDir");
+            Directory.CreateDirectory(Path.Combine(dottedDirParent, "MyApp.v1.0"));
+            Require(Path.GetFileName(ShortcutLibrary.UniquePath(dottedDirParent, "MyApp.v1.0", isDirectory: true)) == "MyApp.v1.0 (2)",
+                "UniquePath for directories must not treat trailing version digits as a file extension");
+
+            var staleItem = new ShortcutItem
+            {
+                Name = "missing",
+                Path = Path.Combine(managedDirectory, "already-gone.txt"),
+                OriginalPath = Path.Combine(desktopDirectory, "already-gone.txt")
+            };
+            var staleLibrary = ShortcutLibrary.CreateForTesting(Path.Combine(testRoot, "StaleRestore"), new List<ShortcutItem> { staleItem });
+            staleLibrary.Restore(staleItem);
+            Require(staleLibrary.Items.Count == 0,
+                "restoring a managed item whose stored file is missing must remove the stale entry instead of throwing");
+
+            var batchRoot = Path.Combine(testRoot, "BatchLibrary");
+            var batchValidFile = Path.Combine(managedDirectory, "batch-valid.txt");
+            var batchUnsupportedFile = Path.Combine(managedDirectory, "batch-skip.tmp");
+            File.WriteAllText(batchValidFile, "ok");
+            File.WriteAllText(batchUnsupportedFile, "skip");
+            var batchLibrary = ShortcutLibrary.CreateForTesting(batchRoot, new List<ShortcutItem>());
+            var (batchAdded, batchWarning) = batchLibrary.AddFiles(new[] { batchValidFile, batchUnsupportedFile, @"C:\" });
+            Require(batchAdded == 1 && batchWarning is not null && File.Exists(Path.Combine(batchRoot, "library.json")),
+                "batch AddFiles must persist valid items and skip unsupported or root paths cleanly");
             return true;
         }
         catch (Exception ex)

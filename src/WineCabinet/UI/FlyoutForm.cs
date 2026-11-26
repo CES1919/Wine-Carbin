@@ -12,7 +12,10 @@ internal sealed class FlyoutForm : Form
     private readonly ShortcutLibrary _library;
     private readonly LauncherForm _launcher;
     private readonly GridLayoutSettings _layoutSettings;
-    private LibraryFileWatcher? _fileWatcher;
+    private readonly Font _itemFont;
+    private readonly Font _pageFont;
+    private readonly ContextMenuStrip _centerMenu;
+    private readonly EventHandler _libraryChangedHandler;
     private readonly TableLayoutPanel _grid;
     private readonly PageBadge _pageIndicator;
     private readonly System.Windows.Forms.Timer _hideTimer;
@@ -30,6 +33,7 @@ internal sealed class FlyoutForm : Form
     private ShortcutItem? _dragCandidate;
     private Point _dragStartScreen;
     private bool _dragStarted;
+    private bool _dragCancelled;
     private bool _internalDropCompleted;
     private bool _suppressNextLaunch;
     private ShortcutItem? _pendingDropTarget;
@@ -49,6 +53,10 @@ internal sealed class FlyoutForm : Form
         _launcher = launcher;
         _layoutSettings = GridLayoutSettings.Load();
         _gridDimension = _layoutSettings.Dimension;
+        _itemFont = new Font("Segoe UI Variable Text", 8.75f, FontStyle.Regular);
+        _pageFont = new Font("Segoe UI Variable Text", 8f, FontStyle.Regular);
+        _centerMenu = CreateCenterMenu();
+        _libraryChangedHandler = (_, _) => Rebuild();
         Text = "Wine Cabinet";
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
@@ -86,7 +94,7 @@ internal sealed class FlyoutForm : Form
             Text = "1 / 1",
             Size = new Size(48, 20),
             TextAlign = ContentAlignment.MiddleCenter,
-            Font = new Font("Segoe UI Variable Text", 8f, FontStyle.Regular),
+            Font = _pageFont,
             ForeColor = Color.FromArgb(72, 72, 76),
             BackColor = Color.White,
             Cursor = Cursors.Default
@@ -114,15 +122,26 @@ internal sealed class FlyoutForm : Form
         FormClosing += (_, e) => { if (!AllowClose) { e.Cancel = true; StartCollapse(); } };
         FormClosed += (_, _) =>
         {
-            _fileWatcher?.Dispose();
+            _library.Changed -= _libraryChangedHandler;
+            _hideTimer.Stop();
+            _animationTimer.Stop();
+            _dragEdgeTimer.Stop();
+            _hideTimer.Dispose();
+            _animationTimer.Dispose();
+            _dragEdgeTimer.Dispose();
+            _centerMenu.Dispose();
+            _itemFont.Dispose();
+            _pageFont.Dispose();
+            var region = Region;
+            Region = null;
+            region?.Dispose();
             if (_centerImage is not null)
             {
                 if (_centerAnimationHandler is not null) ImageAnimator.StopAnimate(_centerImage, _centerAnimationHandler);
                 _centerArtwork?.Dispose();
             }
         };
-        Shown += (_, _) => _fileWatcher ??= new LibraryFileWatcher(_library, this);
-        _library.Changed += (_, _) => Rebuild();
+        _library.Changed += _libraryChangedHandler;
         Rebuild();
         UpdateRegion();
     }
@@ -272,8 +291,7 @@ internal sealed class FlyoutForm : Form
         {
             control.MouseDown += BeginCenterMove;
         }
-        var menu = CreateCenterMenu();
-        tile.ContextMenuStrip = artwork.ContextMenuStrip = menu;
+        tile.ContextMenuStrip = artwork.ContextMenuStrip = _centerMenu;
         return tile;
     }
 
@@ -281,8 +299,25 @@ internal sealed class FlyoutForm : Form
     {
         var tile = NewTile(Color.FromArgb(242, 242, 247), Cursors.Hand);
         var icon = new PictureBox { Size = new Size(44, 44), Location = new Point(30, 14), SizeMode = PictureBoxSizeMode.Zoom, Image = GetIcon(item) };
-        var name = new Label { Text = item.Name, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.FromArgb(43, 43, 47), Font = new Font("Segoe UI Variable Text", 8.75f, FontStyle.Regular), Location = new Point(6, 63), Size = new Size(92, 28) };
+        icon.Disposed += (_, _) =>
+        {
+            var image = icon.Image;
+            icon.Image = null;
+            image?.Dispose();
+        };
+        var name = new Label { Text = item.Name, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.FromArgb(43, 43, 47), Font = _itemFont, Location = new Point(6, 63), Size = new Size(92, 28) };
+        void layoutTile()
+        {
+            if (tile.Width < 16 || tile.Height < 16) return;
+            var labelHeight = Math.Clamp(TextRenderer.MeasureText("Ag中", _itemFont).Height + 10, 24, Math.Max(24, tile.Height / 2));
+            name.SetBounds(4, Math.Max(0, tile.Height - labelHeight - 6), Math.Max(1, tile.Width - 8), labelHeight);
+            var availableHeight = Math.Max(16, name.Top - 8);
+            var iconSize = Math.Clamp(Math.Min(44, Math.Min(tile.Width - 16, availableHeight)), 16, 44);
+            icon.SetBounds((tile.Width - iconSize) / 2, Math.Max(4, (name.Top - iconSize) / 2), iconSize, iconSize);
+        }
+        tile.SizeChanged += (_, _) => layoutTile();
         tile.Controls.Add(icon); tile.Controls.Add(name);
+        layoutTile();
         void launch(object? _, MouseEventArgs e)
         {
             if (!InputRules.ShouldLaunch(e.Button)) return;
@@ -420,6 +455,7 @@ internal sealed class FlyoutForm : Form
     private void StartItemDrag(ShortcutItem item)
     {
         _dragStarted = true;
+        _dragCancelled = false;
         _internalDropCompleted = false;
         _pendingDropTarget = null;
         _suppressNextLaunch = true;
@@ -428,11 +464,22 @@ internal sealed class FlyoutForm : Form
         data.SetData(InternalDragFormat, item.Name);
         _edgePageArmed = true;
         _dragEdgeTimer.Start();
+        void onQueryContinueDrag(object? _, QueryContinueDragEventArgs e)
+        {
+            if (e.EscapePressed || e.Action == DragAction.Cancel)
+                _dragCancelled = true;
+        }
+        QueryContinueDrag += onQueryContinueDrag;
         try { DoDragDrop(data, DragDropEffects.Move); }
-        finally { _dragEdgeTimer.Stop(); }
+        finally
+        {
+            QueryContinueDrag -= onQueryContinueDrag;
+            _dragEdgeTimer.Stop();
+        }
         if (_internalDropCompleted && _pendingDropTarget is not null)
             _library.Swap(item, _pendingDropTarget);
-        else if (DragNavigation.Decide(Bounds, Cursor.Position, _page, Math.Max(0, (_library.Items.Count - 1) / ItemsPerPage)) == DragEdgeAction.Remove)
+        else if (!_dragCancelled && _edgePageArmed &&
+                 DragNavigation.Decide(Bounds, Cursor.Position, _page, Math.Max(0, (_library.Items.Count - 1) / ItemsPerPage)) == DragEdgeAction.Remove)
             ReturnToDesktop(item);
         _dragCandidate = null;
         _dragStarted = false;
@@ -570,22 +617,37 @@ internal sealed class FlyoutForm : Form
         return bitmap;
     }
 
+    private static string GetExplorerPath() =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
+
     private void Launch(ShortcutItem item)
     {
         try
         {
+            if (item.IsShellItem)
+            {
+                var startInfo = new ProcessStartInfo(GetExplorerPath()) { UseShellExecute = false };
+                startInfo.ArgumentList.Add($"shell:{item.Path}");
+                Process.Start(startInfo);
+            }
+            else
+            {
+                Process.Start(new ProcessStartInfo(item.Path) { UseShellExecute = true });
+            }
             _library.RecordLaunch(item, ItemsPerPage);
-            if (item.IsShellItem) Process.Start(new ProcessStartInfo("explorer.exe", $"shell:{item.Path}") { UseShellExecute = true });
-            else Process.Start(new ProcessStartInfo(item.Path) { UseShellExecute = true });
             StartCollapse();
         }
-        catch (Exception ex) { MessageBox.Show($"无法打开：{ex.Message}", "Wine Cabinet", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            // User cancelled elevation prompt.
+        }
+        catch (Exception ex) { MessageBox.Show(this, $"无法打开：{ex.Message}", "Wine Cabinet", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
     }
 
     private void Restore(ShortcutItem item)
     {
-        try { MessageBox.Show(_library.Restore(item), "Wine Cabinet", MessageBoxButtons.OK, MessageBoxIcon.Information); }
-        catch (Exception ex) { MessageBox.Show($"恢复失败：{ex.Message}", "Wine Cabinet", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        try { MessageBox.Show(this, _library.Restore(item), "Wine Cabinet", MessageBoxButtons.OK, MessageBoxIcon.Information); }
+        catch (Exception ex) { MessageBox.Show(this, $"恢复失败：{ex.Message}", "Wine Cabinet", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
     }
 
     private static void OpenContainingFolder(ShortcutItem item)
@@ -593,10 +655,17 @@ internal sealed class FlyoutForm : Form
         try
         {
             var path = item.Path;
+            var startInfo = new ProcessStartInfo(GetExplorerPath()) { UseShellExecute = false };
             if (Directory.Exists(path))
-                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{path}\"") { UseShellExecute = true });
+            {
+                startInfo.ArgumentList.Add(path);
+            }
             else
-                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true });
+            {
+                startInfo.ArgumentList.Add("/select,");
+                startInfo.ArgumentList.Add(path);
+            }
+            Process.Start(startInfo);
         }
         catch (Exception ex)
         {
@@ -632,9 +701,12 @@ internal sealed class FlyoutForm : Form
 
     private void UpdateRegion()
     {
+        if (Width < 2 || Height < 2) return;
         var radius = Math.Min(28, Math.Max(12, Math.Min(Width, Height) / 5));
         using var path = RoundedRectangle(new Rectangle(0, 0, Width, Height), radius);
+        var previous = Region;
         Region = new Region(path);
+        previous?.Dispose();
     }
 
     private void LayoutPageIndicator()
@@ -655,8 +727,12 @@ internal sealed class FlyoutForm : Form
         var size = CurrentExpandedSize;
         var area = Screen.FromPoint(center).WorkingArea;
         var desired = new Rectangle(center.X - AnchorOffset, center.Y - AnchorOffset, size.Width, size.Height);
-        desired.X = Math.Clamp(desired.X, area.Left + 8, area.Right - desired.Width - 8);
-        desired.Y = Math.Clamp(desired.Y, area.Top + 8, area.Bottom - desired.Height - 8);
+        var minX = area.Left + 8;
+        var maxX = Math.Max(minX, area.Right - desired.Width - 8);
+        var minY = area.Top + 8;
+        var maxY = Math.Max(minY, area.Bottom - desired.Height - 8);
+        desired.X = Math.Clamp(desired.X, minX, maxX);
+        desired.Y = Math.Clamp(desired.Y, minY, maxY);
         return desired;
     }
 
@@ -669,6 +745,11 @@ internal sealed class FlyoutForm : Form
     {
         var path = new GraphicsPath();
         var d = Math.Min(radius * 2, Math.Min(rect.Width, rect.Height));
+        if (d < 1)
+        {
+            path.AddRectangle(rect);
+            return path;
+        }
         path.AddArc(rect.Left, rect.Top, d, d, 180, 90); path.AddArc(rect.Right - d, rect.Top, d, d, 270, 90);
         path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90); path.AddArc(rect.Left, rect.Bottom - d, d, d, 90, 90);
         path.CloseFigure(); return path;
@@ -684,7 +765,26 @@ internal sealed class FlyoutForm : Form
             SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
         }
 
-        protected override void OnResize(EventArgs eventargs) { base.OnResize(eventargs); if (Width < 2 || Height < 2) return; using var path = RoundedRectangle(ClientRectangle, 16); Region = new Region(path); }
+        protected override void OnResize(EventArgs eventargs)
+        {
+            base.OnResize(eventargs);
+            if (Width < 2 || Height < 2) return;
+            using var path = RoundedRectangle(ClientRectangle, 16);
+            var previous = Region;
+            Region = new Region(path);
+            previous?.Dispose();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                var region = Region;
+                Region = null;
+                region?.Dispose();
+            }
+            base.Dispose(disposing);
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -717,7 +817,20 @@ internal sealed class FlyoutForm : Form
             base.OnResize(e);
             if (Width < 2 || Height < 2) return;
             using var path = RoundedRectangle(ClientRectangle, Height / 2);
+            var previous = Region;
             Region = new Region(path);
+            previous?.Dispose();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                var region = Region;
+                Region = null;
+                region?.Dispose();
+            }
+            base.Dispose(disposing);
         }
 
         protected override void OnPaint(PaintEventArgs e)

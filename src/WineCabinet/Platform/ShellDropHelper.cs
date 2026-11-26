@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 
 namespace WineCabinet;
@@ -17,20 +18,16 @@ internal static class ShellDropHelper
         if (raw is MemoryStream stream) bytes = stream.ToArray();
         else if (raw is byte[] array) bytes = array;
         else return result;
-        if (bytes.Length < 12) return result;
+        if (!TryReadValidatedCidaOffsets(bytes, out var parentOffset, out var childOffsets))
+            return result;
 
         var handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
         try
         {
             var basePtr = handle.AddrOfPinnedObject();
-            var count = Marshal.ReadInt32(basePtr);
-            if (count <= 0 || count > 256 || bytes.Length < 4 + (count + 1) * 4) return result;
-            var parentOffset = Marshal.ReadInt32(basePtr, 4);
             var parent = IntPtr.Add(basePtr, parentOffset);
-            for (var i = 0; i < count; i++)
+            foreach (var childOffset in childOffsets)
             {
-                var childOffset = Marshal.ReadInt32(basePtr, 8 + i * 4);
-                if (childOffset <= 0 || childOffset >= bytes.Length) continue;
                 var absolute = ILCombine(parent, IntPtr.Add(basePtr, childOffset));
                 if (absolute == IntPtr.Zero) continue;
                 try
@@ -43,9 +40,49 @@ internal static class ShellDropHelper
                 finally { ILFree(absolute); }
             }
         }
-        catch { /* Unsupported shell payload: caller can use the system-icon menu. */ }
+        catch { /* Unsupported shell payload: caller can retry via standard drag-and-drop. */ }
         finally { handle.Free(); }
         return result;
+    }
+
+    internal static bool TryReadValidatedCidaOffsets(ReadOnlySpan<byte> bytes, out int parentOffset, out List<int> childOffsets)
+    {
+        parentOffset = 0;
+        childOffsets = new List<int>();
+        if (bytes.Length < 12) return false;
+
+        var count = BinaryPrimitives.ReadInt32LittleEndian(bytes);
+        if (count <= 0 || count > 256) return false;
+
+        var headerSize = 4 + (count + 1) * 4;
+        if (bytes.Length < headerSize) return false;
+
+        parentOffset = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(4, 4));
+        if (parentOffset < headerSize || !IsValidPidl(bytes, parentOffset))
+            return false;
+
+        for (var i = 0; i < count; i++)
+        {
+            var childOffset = BinaryPrimitives.ReadInt32LittleEndian(bytes.Slice(8 + i * 4, 4));
+            if (childOffset < headerSize || !IsValidPidl(bytes, childOffset))
+                continue;
+            childOffsets.Add(childOffset);
+        }
+
+        return childOffsets.Count > 0;
+    }
+
+    internal static bool IsValidPidl(ReadOnlySpan<byte> buffer, int offset)
+    {
+        if (offset < 0 || offset > buffer.Length - 2) return false;
+        while (offset <= buffer.Length - 2)
+        {
+            var cb = BinaryPrimitives.ReadUInt16LittleEndian(buffer.Slice(offset, 2));
+            if (cb == 0) return true;
+            if (cb < 2 || offset > buffer.Length - cb) return false;
+            offset += cb;
+        }
+        return false;
     }
 
     public static Image? GetIcon(string parsingName)

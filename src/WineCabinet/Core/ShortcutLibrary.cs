@@ -32,23 +32,37 @@ internal sealed class ShortcutLibrary
 
     internal static ShortcutLibrary CreateForTesting(string root, List<ShortcutItem> items) => new(root, items);
 
-    public static ShortcutLibrary Load()
+    public static ShortcutLibrary Load() => LoadFrom(AppStorage.Directory);
+
+    internal static ShortcutLibrary LoadFrom(string root)
     {
-        var root = AppStorage.Directory;
         var json = System.IO.Path.Combine(root, "library.json");
         try
         {
             if (File.Exists(json))
             {
-                var items = JsonSerializer.Deserialize<List<ShortcutItem>>(File.ReadAllText(json));
-                var library = new ShortcutLibrary(root, items?.Where(x =>
-                    x.IsShellItem || File.Exists(x.Path) || Directory.Exists(x.Path)).ToList());
+                var items = JsonSerializer.Deserialize<List<ShortcutItem?>>(File.ReadAllText(json));
+                var valid = items?
+                    .Where(x => x is not null && !string.IsNullOrWhiteSpace(x.Path) &&
+                                (x.IsShellItem || File.Exists(x.Path) || Directory.Exists(x.Path)))
+                    .Select(x => x!)
+                    .ToList();
+                var library = new ShortcutLibrary(root, valid);
                 foreach (var shellItem in library.Items.Where(x => x.IsShellItem))
                     ShellDesktopIconManager.SetVisible(shellItem.Path, false);
                 return library;
             }
         }
-        catch { /* A damaged config should not stop the launcher. */ }
+        catch
+        {
+            // A damaged config should not stop the launcher; preserve a backup for recovery.
+            try
+            {
+                if (File.Exists(json))
+                    File.Copy(json, json + ".corrupt", overwrite: true);
+            }
+            catch { }
+        }
         return new ShortcutLibrary(root);
     }
 
@@ -56,40 +70,71 @@ internal sealed class ShortcutLibrary
     {
         var added = 0;
         var skipped = new List<string>();
-        foreach (var source in paths.Distinct(StringComparer.OrdinalIgnoreCase))
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
         {
-            if ((!File.Exists(source) && !Directory.Exists(source)) || !IsSupported(source))
+            foreach (var rawSource in paths)
             {
-                skipped.Add(System.IO.Path.GetFileName(source));
-                continue;
-            }
-            if (_items.Any(x => string.Equals(x.Path, source, StringComparison.OrdinalIgnoreCase) ||
-                                string.Equals(x.OriginalPath, source, StringComparison.OrdinalIgnoreCase)))
-                continue;
+                if (string.IsNullOrWhiteSpace(rawSource)) continue;
+                var source = NormalizeFileSystemPath(rawSource);
+                if (!seen.Add(source)) continue;
+                var fileName = System.IO.Path.GetFileName(source);
+                if (string.IsNullOrEmpty(fileName) || (!File.Exists(source) && !Directory.Exists(source)) || !IsSupported(source))
+                {
+                    skipped.Add(string.IsNullOrEmpty(fileName) ? rawSource : fileName);
+                    continue;
+                }
+                if (_items.Any(x => string.Equals(x.Path, source, StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(x.OriginalPath, source, StringComparison.OrdinalIgnoreCase)))
+                    continue;
 
-            var storedPath = source;
-            string? originalPath = null;
-            if (IsDesktopFile(source))
-            {
-                var storage = System.IO.Path.Combine(_root, "Items");
-                Directory.CreateDirectory(storage);
-                storedPath = UniquePath(storage, System.IO.Path.GetFileName(source));
-                if (Directory.Exists(source)) Directory.Move(source, storedPath);
-                else File.Move(source, storedPath);
-                originalPath = source;
-            }
+                var isDirectory = Directory.Exists(source);
+                var storedPath = source;
+                string? originalPath = null;
+                try
+                {
+                    var desktopKind = GetDesktopKind(source);
+                    if (desktopKind != DesktopKind.None)
+                    {
+                        var storage = System.IO.Path.Combine(_root, "Items");
+                        Directory.CreateDirectory(storage);
+                        var candidate = UniquePath(storage, fileName, isDirectory);
+                        try
+                        {
+                            if (isDirectory) MoveDirectory(source, candidate);
+                            else File.Move(source, candidate);
+                            storedPath = candidate;
+                            originalPath = source;
+                        }
+                        catch (UnauthorizedAccessException) when (desktopKind == DesktopKind.CommonDesktop)
+                        {
+                            // Common Desktop typically requires elevation to move; register in place instead.
+                            storedPath = source;
+                            originalPath = null;
+                        }
+                    }
+                }
+                catch
+                {
+                    skipped.Add(fileName);
+                    continue;
+                }
 
-            _items.Add(new ShortcutItem
-            {
-                Name = Directory.Exists(storedPath)
-                    ? System.IO.Path.GetFileName(source)
-                    : System.IO.Path.GetFileNameWithoutExtension(source),
-                Path = storedPath,
-                OriginalPath = originalPath
-            });
-            added++;
+                _items.Add(new ShortcutItem
+                {
+                    Name = isDirectory
+                        ? fileName
+                        : System.IO.Path.GetFileNameWithoutExtension(source),
+                    Path = storedPath,
+                    OriginalPath = originalPath
+                });
+                added++;
+            }
         }
-        if (added > 0) SaveAndNotify();
+        finally
+        {
+            if (added > 0) SaveAndNotify();
+        }
         var warning = skipped.Count == 0 ? null : $"部分项目无法收纳，已跳过：{string.Join("、", skipped)}";
         return (added, warning);
     }
@@ -98,9 +143,9 @@ internal sealed class ShortcutLibrary
     {
         if (string.IsNullOrWhiteSpace(parsingName))
             return false;
-        ShellDesktopIconManager.SetVisible(parsingName, false);
         if (_items.Any(x => x.IsShellItem && string.Equals(x.Path, parsingName, StringComparison.OrdinalIgnoreCase)))
             return false;
+        ShellDesktopIconManager.SetVisible(parsingName, false);
         _items.Add(new ShortcutItem
         {
             Name = name,
@@ -109,6 +154,42 @@ internal sealed class ShortcutLibrary
         });
         SaveAndNotify();
         return true;
+    }
+
+    public (int added, string? warning) AddDroppedShellItems(IEnumerable<(string Name, string ParsingName)> droppedItems)
+    {
+        var files = new List<string>();
+        var shellItems = new List<(string Name, string ParsingName)>();
+        foreach (var item in droppedItems)
+        {
+            if (string.IsNullOrWhiteSpace(item.ParsingName)) continue;
+            if (File.Exists(item.ParsingName) || Directory.Exists(item.ParsingName))
+                files.Add(item.ParsingName);
+            else
+                shellItems.Add(item);
+        }
+
+        var added = 0;
+        string? warning = null;
+        if (files.Count > 0)
+            (added, warning) = AddFiles(files);
+
+        var shellAdded = 0;
+        foreach (var shellItem in shellItems)
+        {
+            if (_items.Any(x => x.IsShellItem && string.Equals(x.Path, shellItem.ParsingName, StringComparison.OrdinalIgnoreCase)))
+                continue;
+            ShellDesktopIconManager.SetVisible(shellItem.ParsingName, false);
+            _items.Add(new ShortcutItem
+            {
+                Name = shellItem.Name,
+                Path = shellItem.ParsingName,
+                IsShellItem = true
+            });
+            shellAdded++;
+        }
+        if (shellAdded > 0) SaveAndNotify();
+        return (added + shellAdded, warning);
     }
 
     public void Remove(ShortcutItem item)
@@ -130,11 +211,22 @@ internal sealed class ShortcutLibrary
             Remove(item);
             return "已从图标面板移除（原文件未移动）。";
         }
+        if (!File.Exists(item.Path) && !Directory.Exists(item.Path))
+        {
+            Remove(item);
+            return "原托管文件已不存在，已从图标面板移除。";
+        }
 
-        var targetDirectory = System.IO.Path.GetDirectoryName(item.OriginalPath)!;
+        var isDirectory = Directory.Exists(item.Path);
+        var targetDirectory = System.IO.Path.GetDirectoryName(item.OriginalPath);
+        if (string.IsNullOrEmpty(targetDirectory))
+            targetDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
         Directory.CreateDirectory(targetDirectory);
-        var target = UniquePath(targetDirectory, System.IO.Path.GetFileName(item.OriginalPath));
-        if (Directory.Exists(item.Path)) Directory.Move(item.Path, target);
+        var targetName = System.IO.Path.GetFileName(item.OriginalPath);
+        if (string.IsNullOrEmpty(targetName))
+            targetName = System.IO.Path.GetFileName(item.Path);
+        var target = UniquePath(targetDirectory, targetName, isDirectory);
+        if (isDirectory) MoveDirectory(item.Path, target);
         else File.Move(item.Path, target);
         _items.Remove(item);
         SaveAndNotify();
@@ -192,7 +284,11 @@ internal sealed class ShortcutLibrary
             ? System.IO.Path.GetFileName(newPath)
             : System.IO.Path.GetFileNameWithoutExtension(newPath));
         if (item.OriginalPath is not null)
-            item.OriginalPath = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(item.OriginalPath)!, System.IO.Path.GetFileName(newPath));
+        {
+            var originalDirectory = System.IO.Path.GetDirectoryName(item.OriginalPath);
+            if (!string.IsNullOrEmpty(originalDirectory))
+                item.OriginalPath = System.IO.Path.Combine(originalDirectory, System.IO.Path.GetFileName(newPath));
+        }
         SaveAndNotify();
     }
 
@@ -236,28 +332,77 @@ internal sealed class ShortcutLibrary
     private void SaveAndNotify()
     {
         var options = new JsonSerializerOptions { WriteIndented = true };
-        File.WriteAllText(_jsonPath, JsonSerializer.Serialize(_items, options));
+        AppStorage.WriteAllTextAtomic(_jsonPath, JsonSerializer.Serialize(_items, options));
         Changed?.Invoke(this, EventArgs.Empty);
     }
+
+    private enum DesktopKind { None, UserDesktop, CommonDesktop }
+
+    private static string NormalizeFileSystemPath(string path) =>
+        System.IO.Path.TrimEndingDirectorySeparator(path.Trim());
 
     private static bool IsSupported(string path) =>
         Directory.Exists(path) || !new[] { ".tmp", ".ini", ".db" }.Contains(System.IO.Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
 
-    private static bool IsDesktopFile(string path)
+    private static DesktopKind GetDesktopKind(string path)
     {
-        var parent = System.IO.Path.GetFullPath(System.IO.Path.GetDirectoryName(path) ?? "").TrimEnd('\\');
-        var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory).TrimEnd('\\');
-        var common = Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory).TrimEnd('\\');
-        return parent.Equals(desktop, StringComparison.OrdinalIgnoreCase) ||
-               parent.Equals(common, StringComparison.OrdinalIgnoreCase);
+        var directory = System.IO.Path.GetDirectoryName(path);
+        if (string.IsNullOrEmpty(directory)) return DesktopKind.None;
+        var parent = System.IO.Path.TrimEndingDirectorySeparator(System.IO.Path.GetFullPath(directory));
+        var desktop = System.IO.Path.TrimEndingDirectorySeparator(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
+        if (!string.IsNullOrEmpty(desktop) && parent.Equals(desktop, StringComparison.OrdinalIgnoreCase))
+            return DesktopKind.UserDesktop;
+        var common = System.IO.Path.TrimEndingDirectorySeparator(Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory));
+        if (!string.IsNullOrEmpty(common) && parent.Equals(common, StringComparison.OrdinalIgnoreCase))
+            return DesktopKind.CommonDesktop;
+        return DesktopKind.None;
     }
 
-    private static string UniquePath(string directory, string fileName)
+    private static void MoveDirectory(string source, string destination)
+    {
+        try
+        {
+            Directory.Move(source, destination);
+        }
+        catch (IOException) when (!string.Equals(
+            System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(source)),
+            System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(destination)),
+            StringComparison.OrdinalIgnoreCase))
+        {
+            if ((File.GetAttributes(source) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("不支持跨卷移动符号链接或联接目录。");
+            CopyDirectoryRecursive(source, destination);
+            try
+            {
+                Directory.Delete(source, recursive: true);
+            }
+            catch
+            {
+                try { if (Directory.Exists(destination)) Directory.Delete(destination, recursive: true); } catch { }
+                throw;
+            }
+        }
+    }
+
+    private static void CopyDirectoryRecursive(string source, string destination)
+    {
+        Directory.CreateDirectory(destination);
+        foreach (var file in Directory.GetFiles(source))
+            File.Copy(file, System.IO.Path.Combine(destination, System.IO.Path.GetFileName(file)), overwrite: false);
+        foreach (var subdirectory in Directory.GetDirectories(source))
+        {
+            if ((File.GetAttributes(subdirectory) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("目录包含无法跨卷复制的符号链接。");
+            CopyDirectoryRecursive(subdirectory, System.IO.Path.Combine(destination, System.IO.Path.GetFileName(subdirectory)));
+        }
+    }
+
+    internal static string UniquePath(string directory, string fileName, bool isDirectory = false)
     {
         var candidate = System.IO.Path.Combine(directory, fileName);
         if (!File.Exists(candidate) && !Directory.Exists(candidate)) return candidate;
-        var stem = System.IO.Path.GetFileNameWithoutExtension(fileName);
-        var ext = System.IO.Path.GetExtension(fileName);
+        var stem = isDirectory ? fileName : System.IO.Path.GetFileNameWithoutExtension(fileName);
+        var ext = isDirectory ? "" : System.IO.Path.GetExtension(fileName);
         for (var i = 2; ; i++)
         {
             candidate = System.IO.Path.Combine(directory, $"{stem} ({i}){ext}");

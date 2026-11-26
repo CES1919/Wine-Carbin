@@ -66,6 +66,7 @@ internal sealed class ShellContextMenu : IDisposable
         if (command == RestoreCommand) return ItemMenuAction.Restore;
         if (command == EarlierCommand) return ItemMenuAction.MoveEarlier;
         if (command == LaterCommand) return ItemMenuAction.MoveLater;
+        if (command < FirstCommand || command > LastCommand) return ItemMenuAction.None;
         var verb = GetVerb(command);
         // Rename needs a host edit control; InvokeCommand alone has no Shell view to edit.
         if (verb.Equals("rename", StringComparison.OrdinalIgnoreCase)) return ItemMenuAction.Rename;
@@ -81,21 +82,73 @@ internal sealed class ShellContextMenu : IDisposable
         return verbs;
     }
 
-    internal string Rename(IntPtr owner, string name)
+    private static readonly HashSet<string> ReservedDeviceNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    };
+
+    internal static string ValidateRenameTarget(string name, bool isFileSystem)
     {
         var trimmed = name.Trim();
         if (trimmed.Length == 0) throw new InvalidOperationException("名称不能为空。");
         if (trimmed.Contains('\\') || trimmed.Contains('/') || trimmed.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
             throw new InvalidOperationException("名称包含无效字符。");
-        // 部分 Windows 版本的 IShellFolder.SetNameOf 会把原扩展名再追加一次（例如 after.txt → after.txt.txt），
-        // 因此磁盘上的文件与目录直接使用文件系统 API 重命名，以输入的完整名称作为结果。
-        if (File.Exists(_parsingName) || Directory.Exists(_parsingName))
+        if (isFileSystem)
         {
             if (trimmed.EndsWith(' ') || trimmed.EndsWith('.'))
                 throw new InvalidOperationException("名称不能以空格或句点结尾。");
-            var target = Path.Combine(Path.GetDirectoryName(_parsingName)!, trimmed);
-            if (Directory.Exists(_parsingName)) Directory.Move(_parsingName, target);
-            else File.Move(_parsingName, target);
+            var dotIndex = trimmed.IndexOf('.');
+            var deviceStem = (dotIndex >= 0 ? trimmed[..dotIndex] : trimmed).TrimEnd(' ');
+            if (ReservedDeviceNames.Contains(deviceStem))
+                throw new InvalidOperationException("名称不能使用 Windows 保留设备名。");
+        }
+        return trimmed;
+    }
+
+    internal string Rename(IntPtr owner, string name)
+    {
+        var isFileSystem = File.Exists(_parsingName) || Directory.Exists(_parsingName);
+        var trimmed = ValidateRenameTarget(name, isFileSystem);
+        // 部分 Windows 版本的 IShellFolder.SetNameOf 会把原扩展名再追加一次（例如 after.txt → after.txt.txt），
+        // 因此磁盘上的文件与目录直接使用文件系统 API 重命名，以输入的完整名称作为结果。
+        if (isFileSystem)
+        {
+            var parentDirectory = Path.GetDirectoryName(_parsingName);
+            if (string.IsNullOrEmpty(parentDirectory))
+                throw new InvalidOperationException("无法重命名此路径。");
+            var target = Path.Combine(parentDirectory, trimmed);
+            if (string.Equals(_parsingName, target, StringComparison.Ordinal))
+                return _parsingName;
+
+            var caseOnlyChange = string.Equals(_parsingName, target, StringComparison.OrdinalIgnoreCase);
+            if (!caseOnlyChange && (File.Exists(target) || Directory.Exists(target)))
+                throw new InvalidOperationException("目标位置已存在同名文件或文件夹。");
+
+            if (Directory.Exists(_parsingName))
+            {
+                if (caseOnlyChange)
+                {
+                    var tempPath = Path.Combine(parentDirectory, $".wc-rename-{Guid.NewGuid():N}");
+                    Directory.Move(_parsingName, tempPath);
+                    try { Directory.Move(tempPath, target); }
+                    catch
+                    {
+                        try { Directory.Move(tempPath, _parsingName); } catch { }
+                        throw;
+                    }
+                }
+                else
+                {
+                    Directory.Move(_parsingName, target);
+                }
+            }
+            else
+            {
+                File.Move(_parsingName, target);
+            }
+            _parsingName = target;
             return target;
         }
 
@@ -106,12 +159,23 @@ internal sealed class ShellContextMenu : IDisposable
         try
         {
             Marshal.ThrowExceptionForHR(folder.SetNameOf(owner, child, trimmed, 0, out renamed));
+            if (renamed == IntPtr.Zero) return _parsingName;
             var parent = ILClone(_pidl);
             if (parent == IntPtr.Zero) throw new OutOfMemoryException();
-            try { ILRemoveLastID(parent); absolute = ILCombine(parent, renamed); }
+            try
+            {
+                ILRemoveLastID(parent);
+                absolute = ILCombine(parent, renamed);
+            }
             finally { Marshal.FreeCoTaskMem(parent); }
+            if (absolute == IntPtr.Zero) throw new OutOfMemoryException();
             Marshal.ThrowExceptionForHR(SHGetNameFromIDList(absolute, 0x80028000, out var text));
-            try { return Marshal.PtrToStringUni(text) ?? throw new InvalidOperationException("无法读取重命名后的项目路径。"); }
+            try
+            {
+                var updated = Marshal.PtrToStringUni(text) ?? throw new InvalidOperationException("无法读取重命名后的项目路径。");
+                _parsingName = updated;
+                return updated;
+            }
             finally { Marshal.FreeCoTaskMem(text); }
         }
         finally
@@ -139,15 +203,18 @@ internal sealed class ShellContextMenu : IDisposable
 
     private string GetVerb(uint command)
     {
+        if (command < FirstCommand || command > LastCommand) return "";
         var buffer = Marshal.AllocHGlobal(1024);
         try
         {
             Marshal.WriteInt16(buffer, 0);
-            if (_context!.GetCommandString(new UIntPtr(command - FirstCommand), 4, IntPtr.Zero, buffer, 512) >= 0)
+            Marshal.WriteInt16(buffer, 1022, 0);
+            if (_context!.GetCommandString(new UIntPtr(command - FirstCommand), 4, IntPtr.Zero, buffer, 511) >= 0)
                 return Marshal.PtrToStringUni(buffer) ?? "";
             // Some legacy Shell extensions implement only GCS_VERBA.
             Marshal.WriteByte(buffer, 0);
-            return _context.GetCommandString(new UIntPtr(command - FirstCommand), 0, IntPtr.Zero, buffer, 512) >= 0
+            Marshal.WriteByte(buffer, 511, 0);
+            return _context.GetCommandString(new UIntPtr(command - FirstCommand), 0, IntPtr.Zero, buffer, 511) >= 0
                 ? Marshal.PtrToStringAnsi(buffer) ?? "" : "";
         }
         finally { Marshal.FreeHGlobal(buffer); }

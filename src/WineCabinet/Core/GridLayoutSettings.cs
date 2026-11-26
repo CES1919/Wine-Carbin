@@ -43,9 +43,7 @@ internal sealed class GridLayoutSettings
         Dimension = dimension;
         try
         {
-            var directory = System.IO.Path.GetDirectoryName(_path);
-            if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
-            File.WriteAllText(_path, JsonSerializer.Serialize(new SettingsModel { GridDimension = dimension }));
+            AppStorage.WriteAllTextAtomic(_path, JsonSerializer.Serialize(new SettingsModel { GridDimension = dimension }));
             return true;
         }
         catch

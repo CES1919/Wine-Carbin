@@ -5,15 +5,17 @@ internal static class Program
     private const string StartupLogName = "startup-error.log";
 
     [STAThread]
-    private static void Main(string[] args)
+    private static int Main(string[] args)
     {
         try
         {
             Run(args);
+            return 0;
         }
         catch (Exception ex)
         {
             ReportStartupFailure("启动失败", ex);
+            return 1;
         }
     }
 

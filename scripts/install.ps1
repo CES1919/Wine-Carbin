@@ -17,7 +17,8 @@ if ([System.IO.Path]::GetFileName($source) -ne 'Wine Cabinet.exe') {
 $destinationDirectory = [System.IO.Path]::GetFullPath($InstallDirectory)
 $destination = Join-Path $destinationDirectory 'Wine Cabinet.exe'
 if (-not $PSCmdlet.ShouldProcess($destination, 'Copy Wine Cabinet and register current-user startup')) { return }
-$running = @(Get-Process -Name 'Wine Cabinet' -ErrorAction SilentlyContinue)
+$currentSessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+$running = @(Get-Process -Name 'Wine Cabinet' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $currentSessionId })
 if ($running.Count -gt 0) {
     throw 'Exit the running Wine Cabinet instance before installing or updating.'
 }

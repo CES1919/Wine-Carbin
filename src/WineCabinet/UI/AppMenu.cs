@@ -6,16 +6,24 @@ internal static class AppMenu
 {
     public static ContextMenuStrip Create()
     {
+        var font = new Font("Segoe UI Variable Text", 9.25f, FontStyle.Regular);
         var menu = new ContextMenuStrip
         {
             BackColor = Color.FromArgb(250, 250, 252),
             ForeColor = Color.FromArgb(29, 29, 31),
-            Font = new Font("Segoe UI Variable Text", 9.25f, FontStyle.Regular),
+            Font = font,
             ShowImageMargin = false,
             Padding = new Padding(6),
             Renderer = new MenuRenderer()
         };
         menu.Opened += (_, _) => ApplyRoundedRegion(menu);
+        menu.Disposed += (_, _) =>
+        {
+            var region = menu.Region;
+            menu.Region = null;
+            region?.Dispose();
+            font.Dispose();
+        };
         menu.ItemAdded += (_, e) =>
         {
             if (e.Item is null) return;
@@ -27,6 +35,12 @@ internal static class AppMenu
                 item.DropDown.Padding = menu.Padding;
                 item.DropDown.Renderer = menu.Renderer;
                 item.DropDown.Opened += (_, _) => ApplyRoundedRegion(item.DropDown);
+                item.DropDown.Disposed += (_, _) =>
+                {
+                    var region = item.DropDown.Region;
+                    item.DropDown.Region = null;
+                    region?.Dispose();
+                };
             }
         };
         return menu;
@@ -36,13 +50,20 @@ internal static class AppMenu
     {
         if (strip.Width < 2 || strip.Height < 2) return;
         using var path = RoundedRectangle(new Rectangle(0, 0, strip.Width, strip.Height), 10);
+        var previous = strip.Region;
         strip.Region = new Region(path);
+        previous?.Dispose();
     }
 
     private static GraphicsPath RoundedRectangle(Rectangle rect, int radius)
     {
         var path = new GraphicsPath();
-        var d = radius * 2;
+        var d = Math.Min(radius * 2, Math.Min(rect.Width, rect.Height));
+        if (d < 1)
+        {
+            path.AddRectangle(rect);
+            return path;
+        }
         path.AddArc(rect.Left, rect.Top, d, d, 180, 90);
         path.AddArc(rect.Right - d, rect.Top, d, d, 270, 90);
         path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
@@ -57,7 +78,7 @@ internal static class AppMenu
 
         protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
         {
-            if (!e.Item.Selected) return;
+            if (!e.Item.Selected || e.Item.Width <= 8 || e.Item.Height <= 6) return;
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             using var path = RoundedRectangle(new Rectangle(3, 2, e.Item.Width - 6, e.Item.Height - 4), 7);
             using var brush = new SolidBrush(Color.FromArgb(0, 122, 255));

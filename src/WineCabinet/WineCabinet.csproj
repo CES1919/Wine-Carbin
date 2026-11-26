@@ -13,10 +13,10 @@
     <Authors>Wine Cabinet contributors</Authors>
     <Description>A lightweight desktop organizer for Windows.</Description>
     <Copyright>Copyright (c) Wine Cabinet contributors</Copyright>
-    <Version>0.1.0</Version>
-    <AssemblyVersion>0.1.0.0</AssemblyVersion>
-    <FileVersion>0.1.0.0</FileVersion>
-    <InformationalVersion>0.1.0</InformationalVersion>
+    <Version>0.1.1</Version>
+    <AssemblyVersion>0.1.1.0</AssemblyVersion>
+    <FileVersion>0.1.1.0</FileVersion>
+    <InformationalVersion>0.1.1</InformationalVersion>
     <WineCabinetArtwork Condition="'$(WineCabinetArtwork)' == ''">$(MSBuildProjectDirectory)\..\..\assets\source\launcher.gif</WineCabinetArtwork>
   </PropertyGroup>
   <ItemGroup>

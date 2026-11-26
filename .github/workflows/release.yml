@@ -23,8 +23,10 @@ jobs:
       - name: Resolve version
         id: version
         shell: pwsh
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $version = $env:REF_NAME.TrimStart('v')
           if ($version -notmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
             throw "Release tags must look like v1.2.3: $version"
           }
@@ -37,15 +39,20 @@ jobs:
         run: dotnet restore WineCabinet.sln
 
       - name: Build
-        run: dotnet build WineCabinet.sln -c Release --no-restore -p:Version=${{ steps.version.outputs.value }} -p:InformationalVersion=${{ steps.version.outputs.value }}
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: dotnet build WineCabinet.sln -c Release --no-restore "-p:Version=$env:RELEASE_VERSION" "-p:InformationalVersion=$env:RELEASE_VERSION"
 
       - name: Test
         run: dotnet run --project tests/WineCabinet.Tests/WineCabinet.Tests.csproj -c Release --no-build
 
       - name: Publish executables
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
         run: |
-          $version = '${{ steps.version.outputs.value }}'
+          $version = $env:RELEASE_VERSION
           $root = Join-Path $env:GITHUB_WORKSPACE 'artifacts\release'
           foreach ($rid in @('win-x64', 'win-arm64')) {
             $output = Join-Path $root $rid
@@ -53,9 +60,9 @@ jobs:
               --configuration Release `
               --runtime $rid `
               --self-contained true `
-              -p:PublishProfile=$rid `
-              -p:Version=$version `
-              -p:InformationalVersion=$version `
+              "-p:PublishProfile=$rid" `
+              "-p:Version=$version" `
+              "-p:InformationalVersion=$version" `
               --output $output
             if ($LASTEXITCODE -ne 0) { throw "Publishing $rid failed with exit code $LASTEXITCODE." }
 
@@ -87,8 +94,10 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+          IS_PRERELEASE: ${{ steps.version.outputs.prerelease }}
         run: |
-          $version = '${{ steps.version.outputs.value }}'
+          $version = $env:RELEASE_VERSION
           $root = Join-Path $env:GITHUB_WORKSPACE 'artifacts\release'
           $arguments = @(
             'release', 'create', "v$version",
@@ -98,7 +107,7 @@ jobs:
             (Join-Path $root "WineCabinet-$version-win-arm64.zip"),
             (Join-Path $root 'SHA256SUMS.txt')
           )
-          if ('${{ steps.version.outputs.prerelease }}' -eq 'true') {
+          if ($env:IS_PRERELEASE -eq 'true') {
             $arguments += '--prerelease'
           }
           gh @arguments
